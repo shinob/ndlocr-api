@@ -58,6 +58,8 @@ show_help() {
     echo "  setup       - インストールと初期化を実行"
     echo "  test        - テスト用画像でOCRを実行"
     echo "  clean       - 一時ファイルを削除"
+    echo "  autostart-enable  - OS起動時の自動起動を有効化（systemd ユーザーサービス）"
+    echo "  autostart-disable - 自動起動を無効化してサービスを停止"
     echo "  help        - このヘルプを表示"
     echo ""
     echo "例:"
@@ -283,6 +285,12 @@ stop_services() {
 show_status() {
     log_info "サービスの状態を確認中..."
 
+    # systemd 管理時はPIDファイルを使わないため、プロセス状態は autostart_status 側で表示する
+    if autostart_active; then
+        show_connectivity
+        return
+    fi
+
     # OCRプロセッサの状態
     if [ -f "$OCR_PID_FILE" ] && kill -0 $(cat "$OCR_PID_FILE" 2>/dev/null) 2>/dev/null; then
         log_success "OCRプロセッサ: 起動中 (PID: $(cat $OCR_PID_FILE))"
@@ -305,6 +313,11 @@ show_status() {
         log_success "APIサーバー: 起動中 (PID: $(cat "$API_PID_FILE"))"
     fi
 
+    show_connectivity
+}
+
+# APIへの疎通確認
+show_connectivity() {
     if command -v curl &> /dev/null; then
         if curl --noproxy "*" -4 -s "http://127.0.0.1:$API_PORT/" > /dev/null; then
             log_success "APIサーバーにIPv4で接続できます"
@@ -359,6 +372,130 @@ run_test() {
     log_warning "OCR処理が完了しませんでした。ログを確認してください（logs/ocr_processor.log）。"
 }
 
+# ===== 自動起動（systemd ユーザーサービス） =====
+# OS再起動後もログインなしで起動するよう、systemd --user のユニットを生成し linger を有効化する。
+# ユニットはプロセスを直接管理する（PIDファイルは使わない）。異常終了時は自動で再起動される。
+SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+SYSTEMD_TARGET="ndlocr-api.target"
+SYSTEMD_OCR_UNIT="ndlocr-api-ocr.service"
+
+autostart_active() {
+    command -v systemctl &> /dev/null && systemctl --user is-active --quiet "$SYSTEMD_TARGET" 2>/dev/null
+}
+
+# $1: ユニット名, $2: 説明, $3: ExecStartの引数（venvのpythonに渡す）, $4: ログファイル名
+write_service_unit() {
+    cat > "$SYSTEMD_USER_DIR/$1" <<EOF
+# setup.sh autostart-enable により自動生成（手動編集しないでください）
+[Unit]
+Description=$2
+PartOf=$SYSTEMD_TARGET
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$PROJECT_DIR
+Environment=PYTHONUNBUFFERED=1
+ExecStart=$PROJECT_DIR/venv/bin/python $3
+StandardOutput=append:$PROJECT_DIR/logs/$4
+StandardError=inherit
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=$SYSTEMD_TARGET
+EOF
+}
+
+autostart_enable() {
+    if ! command -v systemctl &> /dev/null; then
+        log_error "systemctl が見つかりません。systemd 環境でのみ利用できます。"
+        exit 1
+    fi
+    if [ ! -x "$PROJECT_DIR/venv/bin/python" ]; then
+        log_error "venv が見つかりません。先に ./setup.sh setup を実行してください。"
+        exit 1
+    fi
+    if [ ! -d "$NDLOCR_LITE_DIR" ]; then
+        log_error "NDLOCR-Lite が見つかりません。先に ./setup.sh install を実行してください。"
+        exit 1
+    fi
+    initialize_directories
+
+    # 手動起動中のプロセスがあるとポートが競合するため停止する
+    if is_running "$OCR_PID_FILE" || is_running "$API_PID_FILE" || is_running "$API_IPV4_PID_FILE" || is_running "$API_IPV6_PID_FILE"; then
+        log_info "手動起動中のサービスを停止し、systemd 管理に切り替えます..."
+        stop_services
+    fi
+
+    mkdir -p "$SYSTEMD_USER_DIR"
+
+    # 以前の設定（異なるAPI_HOST）で作られたAPIユニットを掃除
+    systemctl --user disable --now "ndlocr-api-server"*.service 2>/dev/null || true
+    rm -f "$SYSTEMD_USER_DIR"/ndlocr-api-server*.service
+
+    write_service_unit "$SYSTEMD_OCR_UNIT" "NDLOCR-Lite OCR processor" \
+        "ocr_processor.py" "ocr_processor.log"
+
+    local units=("$SYSTEMD_OCR_UNIT")
+    if [ "$API_HOST" = "dual" ]; then
+        write_service_unit "ndlocr-api-server-ipv4.service" "NDLOCR-Lite API server (IPv4, port $API_PORT)" \
+            "api_server.py --host 0.0.0.0 --port $API_PORT" "api_server_ipv4.log"
+        write_service_unit "ndlocr-api-server-ipv6.service" "NDLOCR-Lite API server (IPv6, port $API_PORT)" \
+            "api_server.py --host :: --port $API_PORT" "api_server_ipv6.log"
+        units+=("ndlocr-api-server-ipv4.service" "ndlocr-api-server-ipv6.service")
+    else
+        write_service_unit "ndlocr-api-server.service" "NDLOCR-Lite API server ($API_HOST, port $API_PORT)" \
+            "api_server.py --host $API_HOST --port $API_PORT" "api_server.log"
+        units+=("ndlocr-api-server.service")
+    fi
+
+    cat > "$SYSTEMD_USER_DIR/$SYSTEMD_TARGET" <<EOF
+# setup.sh autostart-enable により自動生成（手動編集しないでください）
+[Unit]
+Description=NDLOCR-Lite API (OCR processor + API server)
+
+[Install]
+WantedBy=default.target
+EOF
+
+    systemctl --user daemon-reload
+    systemctl --user enable "${units[@]}" "$SYSTEMD_TARGET"
+    systemctl --user restart "$SYSTEMD_TARGET"
+
+    # linger: ログインしていなくても、OS起動時にユーザーのsystemdを起動する
+    if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != "yes" ]; then
+        log_info "linger を有効化します（ログインなしでの起動に必要）..."
+        if ! loginctl enable-linger "$USER" 2>/dev/null; then
+            log_warning "linger の有効化に失敗しました。次を手動で実行してください: sudo loginctl enable-linger $USER"
+        fi
+    fi
+
+    log_success "自動起動を有効化しました（ポート: $API_PORT, 待受: $API_HOST）"
+    log_info "状態確認: systemctl --user status '$SYSTEMD_TARGET' 'ndlocr-api-*'"
+    log_info "停止/起動: systemctl --user stop|start $SYSTEMD_TARGET"
+    sleep 2
+    autostart_status
+}
+
+autostart_disable() {
+    if ! command -v systemctl &> /dev/null; then
+        log_error "systemctl が見つかりません。"
+        exit 1
+    fi
+    systemctl --user stop "$SYSTEMD_TARGET" 2>/dev/null || true
+    systemctl --user disable "$SYSTEMD_TARGET" "$SYSTEMD_OCR_UNIT" "ndlocr-api-server"*.service 2>/dev/null || true
+    rm -f "$SYSTEMD_USER_DIR/$SYSTEMD_TARGET" "$SYSTEMD_USER_DIR/$SYSTEMD_OCR_UNIT" "$SYSTEMD_USER_DIR"/ndlocr-api-server*.service
+    systemctl --user daemon-reload
+    log_success "自動起動を無効化し、サービスを停止しました"
+    log_info "linger は他のユーザーサービスに影響するため変更していません（不要なら: loginctl disable-linger $USER）"
+}
+
+autostart_status() {
+    systemctl --user --no-pager status "$SYSTEMD_TARGET" "$SYSTEMD_OCR_UNIT" "ndlocr-api-server*.service" 2>/dev/null | grep -E "^[●○×] |Active:" || true
+    log_info "linger: $(loginctl show-user "$USER" -p Linger --value 2>/dev/null)"
+}
+
 # 一時ファイルの削除
 clean_temp_files() {
     log_info "一時ファイルを削除中..."
@@ -391,19 +528,30 @@ case "${1:-help}" in
     "init")
         initialize_directories
         ;;
-    "start")
-        start_services
-        ;;
-    "stop")
-        stop_services
-        ;;
-    "restart")
-        stop_services
-        sleep 2
-        start_services
+    "start"|"stop"|"restart")
+        if autostart_active; then
+            log_warning "サービスは systemd（自動起動）で管理されています。"
+            log_info "代わりに次を使用してください: systemctl --user $1 $SYSTEMD_TARGET"
+            exit 1
+        fi
+        case "$1" in
+            "start") start_services ;;
+            "stop") stop_services ;;
+            "restart") stop_services; sleep 2; start_services ;;
+        esac
         ;;
     "status")
+        if autostart_active; then
+            log_info "systemd（自動起動）で管理されています"
+            autostart_status
+        fi
         show_status
+        ;;
+    "autostart-enable")
+        autostart_enable
+        ;;
+    "autostart-disable")
+        autostart_disable
         ;;
     "setup")
         check_python
